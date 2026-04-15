@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Troubleshooting Navigator</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-card: #1c2128;
+            --bg-card-hover: #242c38;
+            --border-color: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+            --accent-purple: #bc8cff;
+            --radius: 12px;
+            --transition: 0.2s ease;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 16px 24px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .header-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .header h1 span { font-size: 24px; }
+
+        /* Breadcrumb */
+        .breadcrumb {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 16px 24px 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            flex-wrap: wrap;
+        }
+        .breadcrumb a {
+            color: var(--accent-blue);
+            text-decoration: none;
+            cursor: pointer;
+            transition: color var(--transition);
+        }
+        .breadcrumb a:hover { color: #79c0ff; text-decoration: underline; }
+        .breadcrumb .separator { color: var(--text-muted); }
+        .breadcrumb .current { color: var(--text-secondary); }
+
+        /* Main Content */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .page-title {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .page-desc {
+            color: var(--text-secondary);
+            font-size: 15px;
+            margin-bottom: 24px;
+        }
+
+        /* Grid for topic/scenario cards */
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px;
+        }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 24px;
+            cursor: pointer;
+            transition: all var(--transition);
+            position: relative;
+            overflow: hidden;
+        }
+        .card:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent-blue);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        .card.coming-soon { opacity: 0.5; cursor: default; }
+        .card.coming-soon:hover { transform: none; border-color: var(--border-color); box-shadow: none; }
+        .card-icon { font-size: 36px; margin-bottom: 12px; display: block; }
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .card-desc {
+            color: var(--text-secondary);
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .card-badge {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 500;
+        }
+        .badge-count {
+            background: rgba(88,166,255,0.15);
+            color: var(--accent-blue);
+        }
+        .badge-soon {
+            background: rgba(210,153,34,0.15);
+            color: var(--accent-orange);
+        }
+
+        /* Problem list */
+        .problem-list { display: flex; flex-direction: column; gap: 12px; }
+        .problem-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            cursor: pointer;
+            transition: all var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .problem-item:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent-blue);
+        }
+        .severity {
+            width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+        }
+        .severity-high { background: var(--accent-red); box-shadow: 0 0 6px rgba(248,81,73,0.4); }
+        .severity-medium { background: var(--accent-orange); box-shadow: 0 0 6px rgba(210,153,34,0.4); }
+        .severity-low { background: var(--accent-green); box-shadow: 0 0 6px rgba(63,185,80,0.4); }
+        .problem-info { flex: 1; }
+        .problem-name { font-weight: 600; font-size: 16px; }
+        .problem-symptoms {
+            color: var(--text-secondary); font-size: 13px; margin-top: 4px;
+        }
+        .problem-arrow { color: var(--text-muted); font-size: 18px; }
+
+        /* Detail page */
+        .detail-section {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            margin-bottom: 16px;
+            overflow: hidden;
+        }
+        .detail-header {
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .detail-body { padding: 20px 24px; }
+
+        /* Symptoms */
+        .symptom-tag {
+            display: inline-block;
+            background: rgba(88,166,255,0.1);
+            color: var(--accent-blue);
+            border: 1px solid rgba(88,166,255,0.2);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            margin: 4px;
+        }
+
+        /* Steps */
+        .step {
+            border-left: 2px solid var(--border-color);
+            padding: 0 0 24px 24px;
+            margin-left: 12px;
+            position: relative;
+        }
+        .step:last-child { border-left-color: transparent; padding-bottom: 0; }
+        .step::before {
+            content: attr(data-step);
+            position: absolute;
+            left: -14px;
+            top: 0;
+            width: 26px; height: 26px;
+            background: var(--accent-blue);
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 13px; font-weight: 600;
+            color: #fff;
+        }
+        .step-title {
+            font-weight: 600;
+            font-size: 16px;
+            margin-bottom: 8px;
+            padding-top: 2px;
+        }
+        .step-detail {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-bottom: 12px;
+            line-height: 1.7;
+        }
+        .step-commands { display: flex; flex-direction: column; gap: 6px; }
+        .cmd {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 16px;
+            font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+            font-size: 13px;
+            color: var(--accent-green);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .cmd code { flex: 1; word-break: break-all; }
+        .cmd .copy-btn {
+            background: none; border: 1px solid var(--border-color);
+            color: var(--text-muted); border-radius: 6px;
+            padding: 4px 10px; cursor: pointer; font-size: 12px;
+            transition: all var(--transition); flex-shrink: 0;
+        }
+        .cmd .copy-btn:hover {
+            color: var(--text-primary); border-color: var(--text-secondary);
+        }
+
+        /* Root Causes */
+        .root-cause-list { list-style: none; }
+        .root-cause-list li {
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-color);
+            display: flex; align-items: flex-start; gap: 10px;
+            color: var(--text-secondary); font-size: 14px;
+        }
+        .root-cause-list li:last-child { border-bottom: none; }
+        .root-cause-list li::before {
+            content: "⚠️"; flex-shrink: 0; margin-top: 1px;
+        }
+
+        /* Animations */
+        .fade-in { animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container { padding: 16px; }
+            .card-grid { grid-template-columns: 1fr; }
+            .page-title { font-size: 22px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-inner">
+            <h1><span>🔍</span> Troubleshooting Navigator</h1>
+            <span style="color: var(--text-muted); font-size: 13px;">Technical Scenario & Troubleshooting Guide</span>
+        </div>
+    </div>
+    <div id="breadcrumb" class="breadcrumb"></div>
+    <div id="app" class="container"></div>
+
+    <script>
+    let DATA = null;
+
+    async function loadData() {
+        const resp = await fetch('data.json');
+        DATA = await resp.json();
+        navigate();
+    }
+
+    function navigate() {
+        const hash = location.hash.slice(1);
+        const parts = hash ? hash.split('/') : [];
+
+        if (parts.length === 0) {
+            renderTopics();
+        } else if (parts.length === 1) {
+            renderScenarios(parts[0]);
+        } else if (parts.length === 2) {
+            renderProblems(parts[0], parts[1]);
+        } else if (parts.length === 3) {
+            renderDetail(parts[0], parts[1], parts[2]);
+        }
+    }
+
+    function renderBreadcrumb(items) {
+        const bc = document.getElementById('breadcrumb');
+        let html = `<a onclick="location.hash=''">🏠 首页</a>`;
+        items.forEach((item, i) => {
+            html += `<span class="separator">/</span>`;
+            if (i < items.length - 1) {
+                html += `<a onclick="location.hash='${item.hash}'">${item.label}</a>`;
+            } else {
+                html += `<span class="current">${item.label}</span>`;
+            }
+        });
+        bc.innerHTML = html;
+    }
+
+    function renderTopics() {
+        renderBreadcrumb([]);
+        const app = document.getElementById('app');
+        let html = `
+            <div class="fade-in">
+                <h2 class="page-title">技术排查主题</h2>
+                <p class="page-desc">选择一个技术领域，浏览相关的排查场景和解决方案</p>
+                <div class="card-grid">
+        `;
+        DATA.topics.forEach(t => {
+            const count = t.scenarios ? t.scenarios.length : 0;
+            const badge = t.comingSoon
+                ? `<span class="card-badge badge-soon">Coming Soon</span>`
+                : `<span class="card-badge badge-count">${count} 个场景</span>`;
+            html += `
+                <div class="card ${t.comingSoon ? 'coming-soon' : ''}"
+                     ${t.comingSoon ? '' : `onclick="location.hash='${t.id}'"`}>
+                    ${badge}
+                    <span class="card-icon">${t.icon}</span>
+                    <div class="card-title">${t.name}</div>
+                    <div class="card-desc">${t.description}</div>
+                </div>
+            `;
+        });
+        html += `</div></div>`;
+        app.innerHTML = html;
+    }
+
+    function renderScenarios(topicId) {
+        const topic = DATA.topics.find(t => t.id === topicId);
+        if (!topic) return renderTopics();
+
+        renderBreadcrumb([{ label: topic.name, hash: topicId }]);
+        const app = document.getElementById('app');
+        let html = `
+            <div class="fade-in">
+                <h2 class="page-title">${topic.icon} ${topic.name}</h2>
+                <p class="page-desc">${topic.description}</p>
+                <div class="card-grid">
+        `;
+        topic.scenarios.forEach(s => {
+            const count = s.problems ? s.problems.length : 0;
+            html += `
+                <div class="card" onclick="location.hash='${topicId}/${s.id}'">
+                    <span class="card-badge badge-count">${count} 个问题</span>
+                    <span class="card-icon">${s.icon}</span>
+                    <div class="card-title">${s.name}</div>
+                    <div class="card-desc">${s.description}</div>
+                </div>
+            `;
+        });
+        html += `</div></div>`;
+        app.innerHTML = html;
+    }
+
+    function renderProblems(topicId, scenarioId) {
+        const topic = DATA.topics.find(t => t.id === topicId);
+        if (!topic) return renderTopics();
+        const scenario = topic.scenarios.find(s => s.id === scenarioId);
+        if (!scenario) return renderScenarios(topicId);
+
+        renderBreadcrumb([
+            { label: topic.name, hash: topicId },
+            { label: scenario.name, hash: `${topicId}/${scenarioId}` }
+        ]);
+
+        const app = document.getElementById('app');
+        let html = `
+            <div class="fade-in">
+                <h2 class="page-title">${scenario.icon} ${scenario.name}</h2>
+                <p class="page-desc">${scenario.description}</p>
+                <div class="problem-list">
+        `;
+        scenario.problems.forEach(p => {
+            const symptomsText = p.symptoms.slice(0, 2).join(' · ');
+            html += `
+                <div class="problem-item" onclick="location.hash='${topicId}/${scenarioId}/${p.id}'">
+                    <div class="severity severity-${p.severity}"></div>
+                    <div class="problem-info">
+                        <div class="problem-name">${p.name}</div>
+                        <div class="problem-symptoms">${symptomsText}</div>
+                    </div>
+                    <div class="problem-arrow">→</div>
+                </div>
+            `;
+        });
+        html += `</div></div>`;
+        app.innerHTML = html;
+    }
+
+    function renderDetail(topicId, scenarioId, problemId) {
+        const topic = DATA.topics.find(t => t.id === topicId);
+        if (!topic) return renderTopics();
+        const scenario = topic.scenarios.find(s => s.id === scenarioId);
+        if (!scenario) return renderScenarios(topicId);
+        const problem = scenario.problems.find(p => p.id === problemId);
+        if (!problem) return renderProblems(topicId, scenarioId);
+
+        renderBreadcrumb([
+            { label: topic.name, hash: topicId },
+            { label: scenario.name, hash: `${topicId}/${scenarioId}` },
+            { label: problem.name, hash: `${topicId}/${scenarioId}/${problemId}` }
+        ]);
+
+        const app = document.getElementById('app');
+        let html = `<div class="fade-in">`;
+
+        // Title with severity
+        const sevLabel = {high: '🔴 高', medium: '🟡 中', low: '🟢 低'};
+        html += `
+            <h2 class="page-title">${problem.name}</h2>
+            <p class="page-desc">严重程度：${sevLabel[problem.severity] || problem.severity}</p>
+        `;
+
+        // Symptoms
+        html += `
+            <div class="detail-section">
+                <div class="detail-header">🩺 常见症状</div>
+                <div class="detail-body">
+                    ${problem.symptoms.map(s => `<span class="symptom-tag">${s}</span>`).join('')}
+                </div>
+            </div>
+        `;
+
+        // Troubleshooting Steps
+        html += `
+            <div class="detail-section">
+                <div class="detail-header">🔧 排查步骤</div>
+                <div class="detail-body">
+        `;
+        problem.troubleshooting.forEach(t => {
+            html += `
+                <div class="step" data-step="${t.step}">
+                    <div class="step-title">${t.title}</div>
+                    <div class="step-detail">${t.detail}</div>
+                    <div class="step-commands">
+                        ${t.commands.map(c => `
+                            <div class="cmd">
+                                <code>${escapeHtml(c)}</code>
+                                <button class="copy-btn" onclick="copyCmd(event, '${escapeAttr(c)}')">Copy</button>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        });
+        html += `</div></div>`;
+
+        // Root Causes
+        html += `
+            <div class="detail-section">
+                <div class="detail-header">🎯 常见根因</div>
+                <div class="detail-body">
+                    <ul class="root-cause-list">
+                        ${problem.rootCauses.map(r => `<li>${r}</li>`).join('')}
+                    </ul>
+                </div>
+            </div>
+        `;
+
+        html += `</div>`;
+        app.innerHTML = html;
+    }
+
+    function escapeHtml(str) {
+        return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    function escapeAttr(str) {
+        return str.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+    }
+
+    function copyCmd(e, text) {
+        e.stopPropagation();
+        navigator.clipboard.writeText(text).then(() => {
+            const btn = e.target;
+            btn.textContent = '✓ Copied';
+            setTimeout(() => btn.textContent = 'Copy', 1500);
+        });
+    }
+
+    window.addEventListener('hashchange', navigate);
+    loadData();
+    </script>
+</body>
+</html>
