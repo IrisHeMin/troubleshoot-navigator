@@ -631,51 +631,92 @@
               "name": "MpsSvc 卡在\"正在启动\"状态",
               "severity": "high",
               "symptoms": [
-                "防火墙服务状态显示 \"Starting\" 持续不变",
-                "Event Log 中看不到 MpsSvc 正常启动完成的事件",
-                "网络连接异常但 ping 正常",
-                "Get-Service MpsSvc 显示 StartPending"
+                "防火墙服务状态显示 \"Starting\" 持续不变（超过 5 分钟）",
+                "Event Log 中看不到 MpsSvc (Event ID 7036) 启动完成的事件",
+                "网络连接部分异常：ping 正常但应用连接被阻断",
+                "Get-Service MpsSvc 返回 Status: StartPending",
+                "Windows Security Center 显示防火墙状态未知",
+                "尝试手动重启服务报错 \"The service did not respond to the start or control request in a timely fashion\" (Error 1053)",
+                "其他依赖 MpsSvc 的服务也无法启动"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
                   "title": "检查服务状态",
-                  "detail": "确认 MpsSvc 当前状态是否为 START_PENDING。",
+                  "detail": "确认 MpsSvc 当前状态是否为 START_PENDING，同时检查 BFE 服务是否正常运行。MpsSvc 依赖 BFE，如果 BFE 异常则 MpsSvc 无法启动。",
                   "commands": [
-                    "Get-Service MpsSvc",
-                    "sc query MpsSvc"
+                    "Get-Service MpsSvc, BFE | Format-Table Name, Status, StartType",
+                    "sc query MpsSvc",
+                    "sc query BFE"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查 BFE 服务",
-                  "detail": "BFE (Base Filtering Engine) 必须先正常运行，MpsSvc 依赖 BFE。",
+                  "title": "检查 BFE 依赖关系",
+                  "detail": "使用 sc qc 查看 MpsSvc 的依赖关系，确认 BFE (Base Filtering Engine) 是否已先行启动。如果 BFE 也未运行，需要先启动 BFE。",
                   "commands": [
-                    "Get-Service BFE"
+                    "sc qc MpsSvc",
+                    "net start BFE"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "检查 PolicyManager 注册表",
-                  "detail": "关键！如果整个 NetworkIsolation 键不存在或 EnterpriseProxyServers 子键缺失，MpsSvc 会卡住。",
+                  "title": "收集事件日志",
+                  "detail": "查询 System 事件日志中 Service Control Manager 的关键事件（7036 服务状态变更、7000 启动失败、7023 终止、7024 错误终止），过滤 MpsSvc 和 BFE 相关条目，查找服务启动失败或超时的记录。",
+                  "commands": [
+                    "Get-WinEvent -LogName System -FilterXPath \"*[System[Provider[@Name='Service Control Manager'] and (EventID=7036 or EventID=7000 or EventID=7023 or EventID=7024)]]\" -MaxEvents 50 | Where-Object {$_.Message -match 'MpsSvc|mpssvc|Firewall|BFE'} | Format-List TimeCreated, Id, Message"
+                  ]
+                },
+                {
+                  "step": 4,
+                  "title": "检查 PolicyManager 注册表（关键步骤）",
+                  "detail": "MpsSvc 启动时会读取 PolicyManager\\default\\NetworkIsolation 注册表键。如果此键缺失或损坏，MpsSvc 会无限等待导致卡在 StartPending 状态。如果返回 \"ERROR: The system was unable to find the specified registry key\"，这就是根因。",
                   "commands": [
                     "reg query \"HKLM\\Software\\Microsoft\\PolicyManager\\default\\NetworkIsolation\" /s"
                   ]
                 },
                 {
-                  "step": 4,
-                  "title": "使用 Procmon 诊断",
-                  "detail": "boot logging 模式抓取 MpsSvc 启动过程，过滤 svchost.exe 对 PolicyManager 路径的访问，查找 NAME NOT FOUND 结果。",
+                  "step": 5,
+                  "title": "导出防火墙相关注册表备份",
+                  "detail": "在进行任何修改前，先导出当前 MpsSvc 和 BFE 服务的注册表配置作为备份，以便出问题时可以恢复。",
                   "commands": [
-                    "Procmon.exe /BackingFile C:\\Logs\\bootlog.pml /AcceptEula"
+                    "reg export \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc\" C:\\temp\\MpsSvc_reg.txt",
+                    "reg export \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\BFE\" C:\\temp\\BFE_reg.txt"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "使用 Procmon Boot Logging 诊断",
+                  "detail": "启用 Procmon 的 Boot Logging 模式，在系统启动时捕获 MpsSvc 的注册表访问行为。重启后收集 boot log，在 Procmon 中过滤 Process Name = svchost.exe、Path contains PolicyManager、Result = NAME NOT FOUND，可精准定位缺失的注册表键。",
+                  "commands": [
+                    "Procmon.exe /BackingFile C:\\temp\\bootlog.pml /AcceptEula /Quiet /EnableBootLogging"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "修复 - 从健康系统导入注册表",
+                  "detail": "从同版本的健康 Windows 系统导出 HKLM\\Software\\Microsoft\\PolicyManager\\default\\NetworkIsolation 注册表键，在问题机器上导入修复缺失的键值，然后重启 MpsSvc 服务验证修复效果。",
+                  "commands": [
+                    "reg import NetworkIsolation_healthy.reg",
+                    "Restart-Service MpsSvc -Force"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "使用 TSS 工具收集完整诊断数据",
+                  "detail": "Microsoft TSS (TroubleShootingScript) 工具可以自动收集防火墙相关的完整诊断数据包，包括注册表、事件日志、WFP 状态等，便于提交给 Microsoft Support 进行深入分析。",
+                  "commands": [
+                    "TSS.ps1 -Scenario NET_Firewall -StartNoWait"
                   ]
                 }
               ],
               "rootCauses": [
-                "PolicyManager\\NetworkIsolation 注册表键缺失或损坏",
-                "BFE (Base Filtering Engine) 服务未运行",
-                "第三方安全软件干扰 WFP 栈",
-                "系统策略更新失败导致注册表不完整"
+                "PolicyManager\\NetworkIsolation 注册表键缺失或损坏（最常见）",
+                "BFE (Base Filtering Engine) 服务未运行或启动失败",
+                "第三方安全软件干扰 WFP (Windows Filtering Platform) 栈",
+                "系统策略更新失败导致注册表不完整",
+                "WFP 驱动加载失败导致 BFE 无法初始化",
+                "系统文件损坏 (sfc /scannow 可检测)"
               ]
             },
             {
@@ -683,49 +724,94 @@
               "name": "防火墙服务内存泄漏",
               "severity": "medium",
               "symptoms": [
-                "svchost.exe (MpsSvc) 内存持续增长",
-                "服务器内存使用率异常升高",
-                "Task Manager 显示 MpsSvc 对应的 svchost 占用大量内存"
+                "svchost.exe (MpsSvc) 进程内存持续增长，从正常的 20-50MB 增长到数百 MB 甚至 GB",
+                "服务器可用内存逐渐减少，最终可能触发低内存警告",
+                "Task Manager 中 \"Service Host: Windows Defender Firewall\" 内存占用异常",
+                "重启 MpsSvc 服务后内存恢复正常但会再次增长",
+                "防火墙规则频繁变更的环境（如使用 IPBan、Fail2Ban 等工具）",
+                "运行 Windows Server 2025 的环境更容易触发"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "确认 MpsSvc 内存占用",
-                  "detail": "获取 MpsSvc 所在 svchost 进程的内存使用情况。",
+                  "title": "确认 MpsSvc 进程和内存占用",
+                  "detail": "获取 MpsSvc 服务对应的 svchost.exe 进程 ID 和当前 Working Set 内存占用。正常情况下应在 20-80MB 范围内，如果超过 200MB 则需要关注。",
                   "commands": [
-                    "Get-Process -Id (Get-WmiObject Win32_Service -Filter \"Name='MpsSvc'\").ProcessId | Select WorkingSet64"
+                    "Get-Process -Id (Get-CimInstance Win32_Service -Filter \"Name='MpsSvc'\").ProcessId | Select-Object Id, WorkingSet64, @{N='WorkingSetMB';E={[math]::Round($_.WorkingSet64/1MB,2)}}"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查防火墙规则变更频率",
-                  "detail": "查看是否有大量规则添加/删除操作。",
+                  "title": "监控内存增长趋势",
+                  "detail": "运行持续监控脚本（每 60 秒记录一次），观察 MpsSvc 的内存是否呈持续增长趋势。运行数小时后对比初始值和最终值，确认是否存在泄漏。",
                   "commands": [
-                    "Get-WinEvent -LogName 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' -MaxEvents 100"
+                    "$pid = (Get-CimInstance Win32_Service -Filter \"Name='MpsSvc'\").ProcessId; while($true) { $ws = (Get-Process -Id $pid).WorkingSet64/1MB; Write-Host \"$(Get-Date -f 'HH:mm:ss') - MpsSvc WS: $([math]::Round($ws,2)) MB\"; Start-Sleep 60 }"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "检查是否有 IPBan 等工具",
-                  "detail": "这类工具频繁添加/删除防火墙规则，是导致 Server 2025 上内存泄漏的常见原因。",
+                  "title": "检查防火墙规则变更频率",
+                  "detail": "分析防火墙事件日志中规则增删操作的频率。大量 Event ID 2004（规则添加）和 2006（规则删除）事件说明规则被频繁修改，这是触发内存泄漏的常见模式。",
                   "commands": [
-                    "Get-NetFirewallRule | Measure-Object",
-                    "Get-ScheduledTask | Where TaskName -match 'IPBan'"
+                    "Get-WinEvent -LogName 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' -MaxEvents 500 | Group-Object Id | Sort Count -Desc | Select Count, Name, @{N='Sample';E={$_.Group[0].Message.Substring(0,80)}}"
                   ]
                 },
                 {
                   "step": 4,
-                  "title": "监控内存趋势",
-                  "detail": "使用 Performance Counter 监控 MpsSvc 进程的 Working Set 变化趋势。",
+                  "title": "检查是否有 IPBan 或类似工具",
+                  "detail": "IPBan、Fail2Ban 等工具会频繁添加/删除防火墙规则来封锁恶意 IP。这种高频规则变更是 Windows Server 2025 上 MpsSvc 内存泄漏的已知触发器。",
                   "commands": [
-                    "perfmon /report"
+                    "Get-Service IPBan* -ErrorAction SilentlyContinue",
+                    "Get-ScheduledTask | Where TaskName -match 'IPBan|fail2ban'",
+                    "Get-NetFirewallRule | Where DisplayName -match 'IPBan|Block' | Measure-Object"
                   ]
+                },
+                {
+                  "step": 5,
+                  "title": "收集内存 Dump 用于分析",
+                  "detail": "在内存占用异常高时使用 procdump 抓取 MpsSvc 所在进程的完整内存转储。此 dump 可用于 Microsoft Support 进行堆内存分析以确认泄漏来源。",
+                  "commands": [
+                    "procdump.exe -ma -accepteula <MpsSvc_PID> C:\\temp\\mpssvc_dump.dmp"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "检查防火墙规则总数",
+                  "detail": "统计当前系统上的防火墙规则总数。如果规则数量异常多（超过 1000 条），规则处理的内存开销本身就很大，且可能加剧泄漏问题。",
+                  "commands": [
+                    "(Get-NetFirewallRule).Count"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "设置 Performance Counter 持续监控",
+                  "detail": "使用 logman 创建性能计数器收集器，每 5 分钟记录一次 MpsSvc 所在 svchost 进程的 Working Set 和 Private Bytes，用于长期监控确认泄漏模式和增长速率。",
+                  "commands": [
+                    "logman create counter MpsSvc_Mem -c \"\\Process(svchost*)\\Working Set\" \"\\Process(svchost*)\\Private Bytes\" -si 00:05:00 -f csv -o C:\\temp\\mpssvc_perfmon.csv",
+                    "logman start MpsSvc_Mem"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "临时缓解措施",
+                  "detail": "设置计划任务定期重启 MpsSvc 服务以释放泄漏的内存。注意：重启期间防火墙规则会短暂失效（通常几秒），在生产环境需评估风险。",
+                  "commands": [
+                    "Restart-Service MpsSvc -Force"
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "联系 Microsoft Support",
+                  "detail": "如果确认是 OS 级别的内存泄漏 Bug，提供内存 dump + perfmon 数据 + 事件日志给 Microsoft Support，可能需要 hotfix 修复。Server 2025 的相关修复可能在后续累积更新中发布。",
+                  "commands": []
                 }
               ],
               "rootCauses": [
                 "第三方工具 (IPBan等) 频繁修改防火墙规则导致内存泄漏",
                 "Windows Server 2025 已知 Bug",
-                "WFP 过滤器频繁增删触发内存碎片"
+                "WFP 过滤器频繁增删触发内存碎片",
+                "防火墙规则数量过多导致内存开销过大",
+                "MpsSvc 内部缓存未正确释放"
               ]
             },
             {
@@ -733,46 +819,110 @@
               "name": "MpsSvc 崩溃导致蓝屏",
               "severity": "critical",
               "symptoms": [
-                "蓝屏 Bugcheck 0xEF (CRITICAL_PROCESS_DIED)",
-                "Dump 中显示 svchost.exe (LocalServiceNoNetworkFirewall) 终止",
-                "蓝屏前可能有第三方安全软件的异常事件"
+                "蓝屏代码 Bugcheck 0xEF (CRITICAL_PROCESS_DIED)",
+                "蓝屏参数指向 svchost.exe 进程",
+                "Dump 分析显示崩溃线程在 LocalServiceNoNetworkFirewall svchost 组中",
+                "系统事件日志中有 Event ID 7031 (MpsSvc 意外终止) 紧跟蓝屏",
+                "蓝屏前可能有第三方安全软件的崩溃事件 (Application Error Event ID 1000)",
+                "蓝屏间隔不固定，可能数小时到数天一次"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "分析 dump 文件",
-                  "detail": "使用 !analyze -v 查看崩溃线程，如果指向 PspCatchCriticalBreak → PspTerminateAllThreads，说明有进程导致了 svchost 终止。",
+                  "title": "确认蓝屏参数",
+                  "detail": "查看 C:\\Windows\\Minidump\\*.dmp 或 C:\\Windows\\MEMORY.DMP 文件。Bugcheck 0xEF 的第一个参数是被终止的进程地址，需确认是否指向 MpsSvc 所在的 svchost.exe。",
                   "commands": [
-                    "!analyze -v"
+                    "Get-ChildItem C:\\Windows\\Minidump\\*.dmp | Sort LastWriteTime -Desc | Select -First 5 FullName, LastWriteTime"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查 svchost 进程中的模块",
-                  "detail": "使用 lm 命令列出所有 DLL，查找第三方 DLL (如 TetSen.exe for Cisco Secure Workload)。",
+                  "title": "配置完整内存 dump",
+                  "detail": "确保系统配置为生成完整内存 dump（而非 mini dump），这样可以获取更多调试信息。同时确保系统分区有足够磁盘空间（至少等于物理内存大小）。",
+                  "commands": [
+                    "wmic recoveros set DebugInfoType=1"
+                  ]
+                },
+                {
+                  "step": 3,
+                  "title": "使用 WinDbg 分析 dump",
+                  "detail": "使用 !analyze -v 自动分析崩溃原因。检查 PROCESS_NAME 和 IMAGE_NAME 确认是否为 svchost.exe (LocalServiceNoNetworkFirewall)。使用 !process 0 0 svchost.exe 列出所有 svchost 进程的信息。",
+                  "commands": [
+                    "!analyze -v",
+                    "!process 0 0 svchost.exe"
+                  ]
+                },
+                {
+                  "step": 4,
+                  "title": "检查崩溃线程调用栈",
+                  "detail": "使用 .ecxr 切换到异常上下文，然后 k 命令查看调用栈。如果看到 PspCatchCriticalBreak → PspTerminateAllThreads → NtTerminateProcess 的调用链，说明有进程主动终止了 svchost。",
+                  "commands": [
+                    ".ecxr",
+                    "k"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "列出 svchost 中加载的第三方模块",
+                  "detail": "在 WinDbg 中使用 lm 命令列出所有已加载的 DLL 模块，重点查找非 Microsoft 的第三方 DLL。常见问题模块包括 TetSen.exe (Cisco Secure Workload)、各类安全软件 DLL。",
                   "commands": [
                     "lm"
                   ]
                 },
                 {
-                  "step": 3,
-                  "title": "检查事件日志",
-                  "detail": "查看 MpsSvc 异常终止记录。",
+                  "step": 6,
+                  "title": "检查应用程序事件日志",
+                  "detail": "查看 Application 日志中 Event ID 1000（应用程序错误）事件，查找与蓝屏时间接近的应用崩溃记录，特别关注 svchost 或第三方安全软件的崩溃。",
                   "commands": [
-                    "Get-WinEvent -LogName System -FilterXPath \"*[System[EventID=7031 or EventID=7034]]\" -MaxEvents 20"
+                    "Get-WinEvent -LogName Application -FilterXPath \"*[System[EventID=1000]]\" -MaxEvents 30 | Where-Object {$_.Message -match 'svchost|TetSen|security'} | Format-List TimeCreated, Message"
                   ]
                 },
                 {
-                  "step": 4,
+                  "step": 7,
+                  "title": "检查系统事件日志中的服务终止",
+                  "detail": "查看 System 日志中 Event ID 7031（服务意外终止）、7034（服务异常终止）、7023（服务终止并报错）事件，确认 MpsSvc 异常终止的准确时间和错误详情。",
+                  "commands": [
+                    "Get-WinEvent -LogName System -FilterXPath \"*[System[EventID=7031 or EventID=7034 or EventID=7023]]\" -MaxEvents 30 | Format-List TimeCreated, Id, Message"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "收集 WER (Windows Error Reporting) 报告",
+                  "detail": "Windows Error Reporting 会自动收集崩溃时的详细信息。查找 WER 报告存档中与 svchost 相关的报告，可获取崩溃时的模块信息和异常代码。",
+                  "commands": [
+                    "Get-ChildItem C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive -Recurse -Filter *.wer | Sort LastWriteTime -Desc | Select -First 10 FullName"
+                  ]
+                },
+                {
+                  "step": 9,
                   "title": "隔离第三方软件",
-                  "detail": "临时卸载可疑安全软件测试是否解决问题。",
+                  "detail": "暂时卸载或禁用可疑的第三方安全软件，观察是否不再发生蓝屏。如果确认是 Cisco Secure Workload (TetSen.exe) 导致，升级到 3.10.5.7 或更高版本可解决。",
                   "commands": []
+                },
+                {
+                  "step": 10,
+                  "title": "使用 TSS 工具持续监控",
+                  "detail": "配置 TSS 工具在 MpsSvc 崩溃时自动触发数据收集。使用 -WaitEvent 参数监听 Event ID 7031，在服务崩溃瞬间自动收集完整诊断数据。",
+                  "commands": [
+                    "TSS.ps1 -Scenario NET_Firewall -WaitEvent Evt:System:EventID=7031 -StartNoWait"
+                  ]
+                },
+                {
+                  "step": 11,
+                  "title": "检查系统文件完整性",
+                  "detail": "运行系统文件检查器和 DISM 工具，排除系统文件损坏导致 MpsSvc 异常的可能性。",
+                  "commands": [
+                    "sfc /scannow",
+                    "DISM /Online /Cleanup-Image /CheckHealth"
+                  ]
                 }
               ],
               "rootCauses": [
-                "第三方安全软件 (如 Cisco Secure Workload/TetSen.exe) 崩溃并带走 svchost",
-                "安全软件注入 MpsSvc 所在的 svchost 进程后异常",
-                "解决：升级第三方软件版本"
+                "第三方安全软件 (如 Cisco Secure Workload/TetSen.exe) 崩溃并带走 svchost 进程",
+                "安全软件注入 MpsSvc 所在的 svchost 进程后异常终止",
+                "WFP callout 驱动异常导致 svchost 进程终止",
+                "系统文件损坏导致 MpsSvc 运行时异常",
+                "解决：升级第三方软件版本或卸载问题软件"
               ]
             }
           ]
@@ -788,50 +938,114 @@
               "name": "防火墙显示 Public 而非 Domain 配置文件",
               "severity": "high",
               "symptoms": [
-                "Get-NetConnectionProfile 显示 NetworkCategory 为 Public",
-                "组策略中仅对 Domain 配置文件生效的规则不起作用",
-                "应用连接被意外阻断",
-                "nltest /dsgetdc 可以正常找到 DC"
+                "Get-NetConnectionProfile 显示 NetworkCategory 为 Public 而不是 DomainAuthenticated",
+                "防火墙控制面板显示 \"Public Network\" 而非 \"Domain Network\"",
+                "组策略中仅对 Domain Profile 生效的防火墙规则不起作用",
+                "应用连接被意外阻断（因为 Public Profile 更严格）",
+                "nltest /dsgetdc 可以正常找到域控制器",
+                "重启后偶尔能正确识别为 Domain，但不稳定",
+                "常见于 Server 2019 和更早版本"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "确认当前配置文件",
-                  "detail": "查看每个接口的 NetworkCategory。",
+                  "title": "确认当前所有接口的配置文件",
+                  "detail": "列出系统上每个网络接口的配置文件类型、IPv4/IPv6 连接状态，确认哪个接口被错误识别为 Public。",
                   "commands": [
-                    "Get-NetConnectionProfile"
+                    "Get-NetConnectionProfile | Format-Table InterfaceAlias, NetworkCategory, IPv4Connectivity, IPv6Connectivity"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查 NLA 服务",
-                  "detail": "NLA 服务必须正常运行才能识别域网络。",
+                  "title": "检查 NLA 服务状态",
+                  "detail": "NLA (Network Location Awareness) 服务负责网络类型的检测和分类。确认 NlaSvc 服务正在运行且启动类型为 Automatic。",
                   "commands": [
-                    "Get-Service NlaSvc"
+                    "Get-Service NlaSvc | Format-Table Name, Status, StartType",
+                    "sc qc NlaSvc"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "检查 NLS 服务",
-                  "detail": "网络列表服务 (netprofm) 需正常运行。",
+                  "title": "检查 NLS (Network List Service) 状态",
+                  "detail": "网络列表服务 (netprofm) 与 NLA 协作完成网络分类。确认此服务也正常运行。",
                   "commands": [
-                    "Get-Service netprofm"
+                    "Get-Service netprofm | Format-Table Name, Status, StartType"
                   ]
                 },
                 {
                   "step": 4,
                   "title": "检查域控可达性",
-                  "detail": "如果能找到 DC 但配置文件仍错，NLA/NLS 可能有启动序问题。",
+                  "detail": "NLA 通过 Secure Channel 验证来判断是否为域网络。确认域控可达且 Secure Channel 状态正常。",
                   "commands": [
-                    "nltest /dsgetdc:<domain>"
+                    "nltest /dsgetdc:<domain_name>",
+                    "nltest /sc_query:<domain_name>"
                   ]
                 },
                 {
                   "step": 5,
-                  "title": "检查事件日志",
-                  "detail": "查看 NetworkProfile 操作日志。",
+                  "title": "检查 NLA 相关事件",
+                  "detail": "查看 NetworkProfile 操作日志中网络配置文件切换的历史记录，了解何时以及为何配置文件被设置为 Public。",
                   "commands": [
-                    "Get-WinEvent -LogName 'Microsoft-Windows-NetworkProfile/Operational' -MaxEvents 20"
+                    "Get-WinEvent -LogName 'Microsoft-Windows-NetworkProfile/Operational' -MaxEvents 50 | Format-List TimeCreated, Id, Message"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "检查 NLA 诊断日志",
+                  "detail": "NlaSvc 操作日志包含 NLA 网络类型检测的详细过程，可以看到 NLA 为何没有将网络识别为域网络。",
+                  "commands": [
+                    "Get-WinEvent -LogName 'Microsoft-Windows-NlaSvc/Operational' -MaxEvents 50 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "检查 DNS 配置",
+                  "detail": "NLA 依赖 DNS 来探测域控制器。如果 DNS 服务器配置错误或未指向域 DNS，NLA 将无法完成域网络探测。",
+                  "commands": [
+                    "Get-DnsClientServerAddress -InterfaceAlias * | Where ServerAddresses -ne '' | Format-Table InterfaceAlias, ServerAddresses"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "检查网络连接顺序",
+                  "detail": "Interface Metric 最低的接口优先进行网络分类。如果 VPN 或非域接口的 Metric 最低，可能影响 NLA 的判断结果。",
+                  "commands": [
+                    "Get-NetIPInterface | Sort InterfaceMetric | Format-Table InterfaceAlias, InterfaceMetric, ConnectionState"
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "手动强制切换配置文件（测试用）",
+                  "detail": "临时将接口配置文件强制设置为 DomainAuthenticated 进行功能验证。注意：这只是临时测试方法，不解决根因，重启后可能恢复。",
+                  "commands": [
+                    "Set-NetConnectionProfile -InterfaceAlias \"Ethernet\" -NetworkCategory DomainAuthenticated"
+                  ]
+                },
+                {
+                  "step": 10,
+                  "title": "收集 NLA 诊断网络跟踪",
+                  "detail": "使用 netsh trace 收集 NetworkDiagnostics 场景的 ETL 跟踪，可详细分析 NLA 检测域网络的完整流程和失败原因。",
+                  "commands": [
+                    "netsh trace start scenario=NetworkDiagnostics capture=yes tracefile=C:\\temp\\nla_trace.etl",
+                    "netsh trace stop"
+                  ]
+                },
+                {
+                  "step": 11,
+                  "title": "检查防火墙注册表中的配置文件状态",
+                  "detail": "直接检查注册表中 Domain Profile 和 Public Profile 的防火墙启用状态，确认注册表层面的配置是否正确。",
+                  "commands": [
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile\" /v EnableFirewall",
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\PublicProfile\" /v EnableFirewall"
+                  ]
+                },
+                {
+                  "step": 12,
+                  "title": "长期修复",
+                  "detail": "检查 NLA/NLS 服务的依赖关系和启动顺序是否正确。如果有第三方网络管理软件可能干扰 NLA 的判断，需评估是否卸载或更新。",
+                  "commands": [
+                    "sc qc NlaSvc",
+                    "sc qc netprofm"
                   ]
                 }
               ],
@@ -839,7 +1053,9 @@
                 "NLA (Network Location Awareness) 服务启动失败或延迟",
                 "NLS (Network List Service) 服务异常",
                 "域控 (DC) 在 NLA 启动时不可达导致配置文件判断错误",
-                "网卡驱动问题导致网络就绪信号延迟"
+                "DNS 配置错误导致 NLA 无法探测域网络",
+                "网卡驱动问题导致网络就绪信号延迟",
+                "第三方网络管理软件干扰 NLA 检测"
               ]
             },
             {
@@ -847,46 +1063,84 @@
               "name": "Win11 24H2/25H2 域配置文件不切换",
               "severity": "medium",
               "symptoms": [
-                "升级到 Win11 24H2 或 25H2 后防火墙不切换到 Domain profile",
-                "网络接口已通过域认证但配置文件仍为 Private/Public",
-                "组策略防火墙规则不生效"
+                "升级到 Windows 11 24H2 或 25H2 后防火墙不再自动切换到 Domain Profile",
+                "即使域认证 (Secure Channel) 完全正常，配置文件仍停留在 Private 或 Public",
+                "之前在旧版本 Windows 上正常工作的配置",
+                "组策略防火墙规则（Domain Profile 专用）不再生效",
+                "Get-NetConnectionProfile 始终显示 Private 或 Public",
+                "问题在 OS 升级后立即出现"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
                   "title": "确认 OS 版本",
-                  "detail": "确认是否为 Win11 24H2 或 25H2。",
+                  "detail": "确认系统是否为 Windows 11 24H2 (Build 26100.x) 或 25H2。这是这些版本的已知问题。",
                   "commands": [
-                    "winver",
-                    "[System.Environment]::OSVersion"
+                    "[System.Environment]::OSVersion",
+                    "Get-ComputerInfo | Select OsName, OsVersion, OsBuildNumber"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "确认域认证状态",
-                  "detail": "检查 Secure Channel 是否正常。",
+                  "title": "确认域认证正常",
+                  "detail": "验证 Secure Channel 到域控制器的连接状态正常。如果显示 NERR_Success，说明域认证本身没有问题，问题在于 NLA 的配置文件切换。",
                   "commands": [
                     "nltest /sc_query:<domain>"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "检查网络配置文件",
-                  "detail": "确认当前网络配置文件状态。",
+                  "title": "测试 LDAP 连通性",
+                  "detail": "确认 LDAP (389) 和 LDAPS (636) 端口可达。NLA 使用 LDAP 查询来验证域身份。",
                   "commands": [
-                    "Get-NetConnectionProfile"
+                    "Test-NetConnection -ComputerName <DC_name> -Port 389",
+                    "Test-NetConnection -ComputerName <DC_name> -Port 636"
                   ]
                 },
                 {
                   "step": 4,
-                  "title": "检查已知问题",
-                  "detail": "这是 Win11 24H2/25H2 的已知问题，检查是否有可用的 KB 修复。",
+                  "title": "检查 NLA 事件日志",
+                  "detail": "查看 NetworkProfile 操作日志，了解 NLA 对网络类型的判断过程和结果。",
+                  "commands": [
+                    "Get-WinEvent -LogName 'Microsoft-Windows-NetworkProfile/Operational' -MaxEvents 100 | Format-List TimeCreated, Id, Message"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "检查 NLA 注册表配置",
+                  "detail": "查看 NlaSvc 服务的注册表参数，确认是否有非默认配置可能影响域网络检测行为。",
+                  "commands": [
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\NlaSvc\\Parameters\" /s"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "检查 Windows Update 历史",
+                  "detail": "查看已安装的更新补丁，确认是否有针对此问题的修复补丁已安装或可用。",
+                  "commands": [
+                    "Get-HotFix | Sort InstalledOn -Desc | Select -First 20"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "查找已知问题 KB",
+                  "detail": "搜索 Microsoft Known Issues 页面查找 Windows 11 24H2 NLA/Firewall profile 相关的已知问题和可用补丁。",
                   "commands": []
+                },
+                {
+                  "step": 8,
+                  "title": "临时缓解措施",
+                  "detail": "使用脚本在启动时强制设置网络配置文件为 DomainAuthenticated，或通过 GPO 设置防火墙规则同时应用到所有配置文件以避免依赖 Domain Profile。",
+                  "commands": [
+                    "Set-NetConnectionProfile -InterfaceAlias \"Ethernet\" -NetworkCategory DomainAuthenticated"
+                  ]
                 }
               ],
               "rootCauses": [
                 "Windows 11 24H2/25H2 已知 Bug",
-                "NLA 在新版本中的行为变更"
+                "NLA 在新版本中的行为变更导致域网络检测逻辑异常",
+                "可能与 NLA 服务启动时序变化有关",
+                "等待 Microsoft 发布修复补丁"
               ]
             },
             {
@@ -894,48 +1148,111 @@
               "name": "IPv6 启用后集群节点断开",
               "severity": "critical",
               "symptoms": [
-                "启用 IPv6 后集群节点被移除 (Event 1135)",
-                "Failover Cluster 心跳失败",
-                "防火墙在 Public 配置文件下阻断 ICMPv6"
+                "启用 IPv6 后集群节点被移除，事件日志显示 Event ID 1135 (node removed from active membership)",
+                "Failover Cluster 心跳失败 (Event ID 1177)",
+                "集群验证报告显示节点间 ICMPv6 通信失败",
+                "集群网络接口的防火墙配置文件为 Public",
+                "仅影响 IPv6 链路本地地址 (fe80::) 通信",
+                "IPv4 集群通信正常"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "检查 Cluster 事件",
-                  "detail": "查看集群节点移除事件。",
+                  "title": "检查集群事件",
+                  "detail": "查看 Failover Clustering 操作日志中 Event ID 1135（节点移除）和 1177（心跳失败）事件，确认是否与 IPv6 相关。",
                   "commands": [
-                    "Get-WinEvent -LogName 'Microsoft-Windows-FailoverClustering/Operational' -FilterXPath \"*[System[EventID=1135]]\" -MaxEvents 10"
+                    "Get-WinEvent -LogName 'Microsoft-Windows-FailoverClustering/Operational' -FilterXPath \"*[System[EventID=1135 or EventID=1177]]\" -MaxEvents 20 | Format-List TimeCreated, Message"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查防火墙配置文件",
-                  "detail": "确认集群网络接口是否为 Public。",
+                  "title": "确认集群网络接口配置文件",
+                  "detail": "检查集群使用的网络接口是否被识别为 Public 配置文件。Public 配置文件默认阻断 ICMPv6 Neighbor Solicitation。",
                   "commands": [
-                    "Get-NetConnectionProfile"
+                    "Get-NetConnectionProfile | Format-Table InterfaceAlias, NetworkCategory"
                   ]
                 },
                 {
                   "step": 3,
                   "title": "检查 ICMPv6 规则",
-                  "detail": "确认 Public 配置文件下 ICMPv6 Neighbor Solicitation 是否允许。",
+                  "detail": "列出当前启用的 ICMPv6 相关防火墙规则，确认是否在所有配置文件下允许 ICMPv6。",
                   "commands": [
-                    "Get-NetFirewallRule -DisplayName \"*ICMPv6*\" | Where Enabled -eq True"
+                    "Get-NetFirewallRule | Where-Object {$_.DisplayName -match 'ICMPv6' -and $_.Enabled -eq 'True'} | Format-Table DisplayName, Profile, Action, Direction"
                   ]
                 },
                 {
                   "step": 4,
-                  "title": "抓包验证",
-                  "detail": "过滤 ICMPv6 包 (type 135/136) 是否被丢弃。",
+                  "title": "检查 ICMPv6 Type 135/136 规则",
+                  "detail": "ICMPv6 Neighbor Solicitation (Type 135) 和 Neighbor Advertisement (Type 136) 是 IPv6 网络的 ARP 等价协议，对 IPv6 通信至关重要。确认这两种类型是否被允许。",
                   "commands": [
-                    "pktmon start -c --type all"
+                    "Get-NetFirewallRule | Get-NetFirewallPortFilter | Where Protocol -eq 'ICMPv6'"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "使用 pktmon 抓包验证",
+                  "detail": "使用 pktmon 抓取网络包，转换为 pcap 格式后在 Wireshark 中过滤 ICMPv6 type 135/136，确认这些关键包是否被防火墙丢弃。",
+                  "commands": [
+                    "pktmon start --capture --type all --comp nics -f C:\\temp\\pktmon_icmpv6.etl",
+                    "pktmon stop",
+                    "pktmon etl2pcap C:\\temp\\pktmon_icmpv6.etl"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "检查 WFP 丢包",
+                  "detail": "导出 WFP 网络事件数据，搜索 ICMPv6 相关的 DROP 事件，确认丢包是由哪条 WFP 过滤器规则导致的。",
+                  "commands": [
+                    "netsh wfp show netevents file=C:\\temp\\wfp_events.xml"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "测试 ICMPv6 连通性",
+                  "detail": "使用 IPv6 ping 测试到其他集群节点链路本地地址的连通性。如果 timeout 则确认 ICMPv6 被阻断。",
+                  "commands": [
+                    "ping -6 <other_node_link_local_address>%<interface_id>"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "检查集群防火墙规则",
+                  "detail": "确认 Failover Cluster 相关的防火墙规则是否已启用且配置正确。",
+                  "commands": [
+                    "Get-NetFirewallRule | Where DisplayName -match 'Failover Cluster' | Format-Table DisplayName, Enabled, Profile, Action"
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "修复方案 A - 切换配置文件",
+                  "detail": "将集群网络接口的配置文件从 Public 切换到 Private，以启用默认的 ICMPv6 允许规则。",
+                  "commands": [
+                    "Set-NetConnectionProfile -InterfaceAlias \"<cluster_interface>\" -NetworkCategory Private"
+                  ]
+                },
+                {
+                  "step": 10,
+                  "title": "修复方案 B - 创建自定义 ICMPv6 规则",
+                  "detail": "创建自定义防火墙规则，在所有配置文件下允许 ICMPv6 Neighbor Discovery（Type 135 和 136），同时包括入站和出站方向。",
+                  "commands": [
+                    "New-NetFirewallRule -DisplayName \"Allow ICMPv6 Neighbor Discovery\" -Direction Inbound -Protocol ICMPv6 -IcmpType 135,136 -Profile Any -Action Allow",
+                    "New-NetFirewallRule -DisplayName \"Allow ICMPv6 Neighbor Discovery Out\" -Direction Outbound -Protocol ICMPv6 -IcmpType 135,136 -Profile Any -Action Allow"
+                  ]
+                },
+                {
+                  "step": 11,
+                  "title": "验证修复",
+                  "detail": "运行集群验证测试，确认网络测试通过且节点间 ICMPv6 通信正常。",
+                  "commands": [
+                    "Test-Cluster -Node <node1>,<node2> -Include \"Network\""
                   ]
                 }
               ],
               "rootCauses": [
                 "集群网络接口被识别为 Public 配置文件",
-                "Public 配置文件默认阻断 ICMPv6 Neighbor Solicitation",
-                "ICMPv6 NS 是 IPv6 网络的 ARP 等价协议 (必需)",
+                "Public 配置文件默认阻断 ICMPv6 Neighbor Solicitation (Type 135)",
+                "ICMPv6 NS 是 IPv6 网络的 ARP 等价协议（必需）",
+                "集群心跳依赖 ICMPv6 通信",
                 "解决：切换到 Private 配置文件或添加自定义 ICMPv6 允许规则"
               ]
             }
@@ -952,46 +1269,91 @@
               "name": "Intune 推送的规则显示\"无效\"",
               "severity": "medium",
               "symptoms": [
-                "防火墙 UI 中部分规则显示为 Invalid",
-                "规则来源标识为 MDM/Intune",
-                "规则存储在 Mdm\\FirewallRules 注册表路径下"
+                "防火墙高级安全 (wf.msc) 中部分规则显示红色 X 或标记为 \"Invalid\"",
+                "这些规则的来源/Owner 标识为 MDM 或 Intune",
+                "规则实际不生效（流量未按预期允许/阻断）",
+                "注册表中规则存储在 Mdm\\FirewallRules 路径下",
+                "Intune 管理门户显示策略已成功应用",
+                "本地创建的防火墙规则工作正常"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "查看无效规则",
-                  "detail": "打开 wf.msc，检查入站/出站规则中标记为 Invalid 的条目。",
+                  "title": "查看无效规则详情",
+                  "detail": "打开 wf.msc 防火墙高级安全管理控制台，在入站/出站规则中查找标记为 Invalid 的条目，右键查看属性了解规则定义的具体内容和错误原因。",
                   "commands": [
                     "wf.msc"
                   ]
                 },
                 {
                   "step": 2,
+                  "title": "导出当前防火墙规则备份",
+                  "detail": "在修改前导出当前完整的防火墙策略作为备份。",
+                  "commands": [
+                    "netsh advfirewall export C:\\temp\\firewall_policy.wfw"
+                  ]
+                },
+                {
+                  "step": 3,
                   "title": "检查 MDM 注册表路径",
-                  "detail": "查看 Intune 推送的规则存储。",
+                  "detail": "查看 Intune 推送的规则在注册表中的原始数据，检查规则格式是否正确。MDM 推送的规则存储在与本地规则不同的注册表路径下。",
                   "commands": [
                     "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\FirewallRules\" /s"
                   ]
                 },
                 {
-                  "step": 3,
-                  "title": "检查 Intune 策略",
-                  "detail": "确认 Intune 端配置的规则语法是否正确。",
+                  "step": 4,
+                  "title": "对比本地规则存储",
+                  "detail": "查看本地防火墙规则的注册表存储格式，与 MDM 规则对比，识别格式差异或语法错误。",
+                  "commands": [
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules\" /s"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "使用 PowerShell 检查规则状态",
+                  "detail": "通过 PowerShell 列出所有来源为 MDM 的防火墙规则，检查其启用状态、方向、动作等属性是否正确。",
+                  "commands": [
+                    "Get-NetFirewallRule | Where-Object {$_.PolicyStoreSource -match 'Mdm' -or $_.PolicyStoreSourceType -match 'MDM'} | Format-Table DisplayName, Enabled, Direction, Action, PolicyStoreSource"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "收集 Intune 诊断日志",
+                  "detail": "使用 MDM 诊断工具导出完整的 Intune 诊断信息，包括设备注册和策略应用日志，解压后检查防火墙策略应用过程中的错误。",
+                  "commands": [
+                    "mdmdiagnosticstool.exe -area DeviceEnrollment;DeviceProvisioning;Autopilot -cab C:\\temp\\intune_diag.cab"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "检查防火墙事件日志",
+                  "detail": "查看防火墙高级安全事件日志中是否有规则应用失败或规则无效的错误记录。",
+                  "commands": [
+                    "Get-WinEvent -LogName 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' -MaxEvents 100 | Where Message -match 'rule.*failed|invalid|error' | Format-List TimeCreated, Message"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "在 Intune 端验证规则语法",
+                  "detail": "登录 Intune Portal → Endpoint Security → Firewall，检查规则定义是否有语法错误，如端口范围格式不正确、协议指定错误、或应用路径使用了不支持的通配符等。",
                   "commands": []
                 },
                 {
-                  "step": 4,
-                  "title": "对比本地规则存储",
-                  "detail": "比较 MDM 和本地存储的规则差异。",
+                  "step": 9,
+                  "title": "重新同步 MDM 策略",
+                  "detail": "触发设备与 Intune 的策略重新同步，有时重新推送可以修复规则应用错误。",
                   "commands": [
-                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules\" /s"
+                    "Get-ScheduledTask | Where TaskName -match 'EnterpriseMgmt' | Start-ScheduledTask"
                   ]
                 }
               ],
               "rootCauses": [
-                "Intune 推送的规则格式不正确",
+                "Intune 推送的规则格式不正确（端口范围、协议等语法错误）",
                 "MDM 注册表存储路径与本地存储路径不同导致 UI 显示异常",
-                "Intune 端防火墙规则配置语法错误"
+                "Intune 端防火墙规则配置语法错误",
+                "MDM 策略同步不完整导致规则数据损坏",
+                "规则引用了设备上不存在的应用程序路径"
               ]
             },
             {
@@ -999,46 +1361,97 @@
               "name": "Mandatory Profile 导致防火墙规则膨胀",
               "severity": "high",
               "symptoms": [
-                "防火墙规则数量异常多 (数百甚至上千条重复规则)",
-                "每次用户登录后规则数量增加",
-                "开始菜单/搜索无响应",
-                "登录速度极慢甚至黑屏"
+                "防火墙规则数量异常多（正常约 300-400 条，问题系统可达数千条）",
+                "大量规则具有相同的 DisplayName 但不同的 GUID",
+                "每次用户登录后规则数量增加 10-50 条",
+                "开始菜单点击后无响应或极慢",
+                "Windows Search 无法使用",
+                "登录速度极慢（数分钟），可能出现长时间黑屏",
+                "系统使用 Mandatory User Profile"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "统计规则数量",
-                  "detail": "正常系统约 300-400 条，如果超过 1000 条则异常。",
+                  "title": "统计当前规则数量",
+                  "detail": "统计系统上防火墙规则的总数。正常系统约 300-400 条，超过 800 条需要关注，超过 2000 条表示严重膨胀。",
                   "commands": [
-                    "(Get-NetFirewallRule).Count"
+                    "$rules = Get-NetFirewallRule; Write-Host \"Total rules: $($rules.Count)\""
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查重复规则",
-                  "detail": "按 DisplayName 分组查找重复规则。",
+                  "title": "查找重复规则",
+                  "detail": "按 DisplayName 分组统计，查找出现次数超过 3 次的规则名称。如果同一名称出现几十次，确认是 Mandatory Profile 规则膨胀问题。",
                   "commands": [
-                    "Get-NetFirewallRule | Group-Object DisplayName | Where Count -gt 5 | Sort Count -desc"
+                    "Get-NetFirewallRule | Group-Object DisplayName | Where Count -gt 3 | Sort Count -Desc | Format-Table Count, Name"
                   ]
                 },
                 {
                   "step": 3,
                   "title": "确认是否使用 Mandatory Profile",
-                  "detail": "检查用户配置文件类型。",
-                  "commands": []
+                  "detail": "检查系统上的用户配置文件类型，查找 Mandatory Profile（NTUSER.MAN 文件）的使用情况。",
+                  "commands": [
+                    "Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\*\" | Where-Object {$_.ProfileImagePath -match 'Default|mandatory'} | Format-List PSChildName, ProfileImagePath"
+                  ]
                 },
                 {
                   "step": 4,
-                  "title": "检查注册表规则",
-                  "detail": "统计注册表中存储的规则数量。",
+                  "title": "检查注册表中的规则数量",
+                  "detail": "直接统计注册表中存储的防火墙规则条目数量，与 Get-NetFirewallRule 的结果对比。",
                   "commands": [
-                    "(reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules\" /s | Select-String 'ValueName').Count"
+                    "(reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules\" | Measure-Object -Line).Lines"
                   ]
+                },
+                {
+                  "step": 5,
+                  "title": "监控规则增长",
+                  "detail": "在用户登录前记录规则数量，登录/注销一次后再次记录，确认每次登录的规则增长量。",
+                  "commands": [
+                    "(Get-NetFirewallRule).Count"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "收集性能数据",
+                  "detail": "使用性能计数器监控 SearchHost 和 StartMenuExperienceHost 进程的 CPU 使用情况，验证规则膨胀对系统性能的影响。",
+                  "commands": [
+                    "logman create counter RuleBloat -c \"\\Process(SearchHost)\\% Processor Time\" \"\\Process(StartMenuExperienceHost)\\% Processor Time\" \"\\System\\Processor Queue Length\" -si 5 -f csv -o C:\\temp\\rule_bloat_perf.csv"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "分析规则创建模式",
+                  "detail": "导出所有防火墙规则到 CSV 文件，按名称排序查找重复模式，确认重复规则的创建规律。",
+                  "commands": [
+                    "Get-NetFirewallRule | Select Name, DisplayName, CreationClassName | Export-Csv C:\\temp\\firewall_rules_audit.csv"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "清理重复规则（修复）",
+                  "detail": "按 DisplayName 分组，保留每组中的第一条规则，删除其余重复项。注意：务必先在测试环境验证此操作不会影响正常功能。",
+                  "commands": [
+                    "$dupes = Get-NetFirewallRule | Group-Object DisplayName | Where Count -gt 1; foreach($g in $dupes) { $g.Group | Select-Object -Skip 1 | Remove-NetFirewallRule -Confirm:$false }"
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "预防规则膨胀（临时）",
+                  "detail": "在用户登录脚本中添加规则清理逻辑，或设置计划任务定期清理重复的防火墙规则，防止规则持续膨胀。",
+                  "commands": []
+                },
+                {
+                  "step": 10,
+                  "title": "长期修复",
+                  "detail": "等待 Microsoft 发布针对 Mandatory Profile 规则膨胀的 OS 修复补丁。如果业务允许，考虑切换到非 Mandatory Profile 方案以根本解决此问题。",
+                  "commands": []
                 }
               ],
               "rootCauses": [
-                "Mandatory Profile 每次登录生成新的防火墙规则但不清理旧规则 (已知 Bug)",
+                "Mandatory Profile 每次登录生成新的防火墙规则但不清理旧规则（已知 Bug）",
                 "规则累积导致 WFP 处理开销指数增长",
+                "大量规则导致开始菜单、搜索等依赖 WFP 的组件性能严重下降",
+                "注册表中防火墙规则存储区域持续增长",
                 "解决：定期清理重复规则；等待 OS 修复"
               ]
             },
@@ -1047,48 +1460,98 @@
               "name": "FQDN 防火墙规则导致 Autopilot 失败",
               "severity": "high",
               "symptoms": [
-                "Autopilot 部署过程中卡住或失败",
-                "Intune 配置了基于 URL/FQDN 的出站防火墙规则",
-                "防火墙日志显示 Default Outbound 规则阻断了出站流量",
-                "Defender Network Protection 未运行"
+                "Autopilot 部署 (OOBE) 过程中卡住，进度条不动",
+                "Intune 中配置了基于 URL 或 FQDN 的出站防火墙规则",
+                "防火墙日志 (pfirewall.log) 显示 Default Outbound 规则阻断了本应允许的出站流量",
+                "Get-MpPreference 显示 EnableNetworkProtection = 1 但实际未运行",
+                "Defender 签名版本过旧（查看 AntivirusSignatureLastUpdated）",
+                "仅在全新部署或重置设备时出现"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "检查 Defender 签名版本",
-                  "detail": "确认 Defender 签名是否过期。",
+                  "title": "检查 Defender 签名状态",
+                  "detail": "确认 Defender 反病毒签名的最后更新时间和版本。FQDN 规则依赖 Network Protection 功能，而 Network Protection 需要最新的 Defender 签名才能运行。如果签名日期远早于当前日期，这很可能是根因。",
                   "commands": [
-                    "Get-MpComputerStatus | Select AntivirusSignatureLastUpdated, AntivirusSignatureVersion"
+                    "Get-MpComputerStatus | Select-Object AntivirusSignatureLastUpdated, AntivirusSignatureVersion, AntivirusEnabled, RealTimeProtectionEnabled"
                   ]
                 },
                 {
                   "step": 2,
                   "title": "检查 Network Protection 状态",
-                  "detail": "确认 Network Protection 是否启用。",
+                  "detail": "确认 Network Protection 是否已启用。值为 1 表示配置为启用，但如果 Defender 签名过期，实际运行时 Network Protection 引擎无法启动，导致 FQDN 规则无法解析。",
                   "commands": [
-                    "Get-MpPreference | Select EnableNetworkProtection"
+                    "Get-MpPreference | Select-Object EnableNetworkProtection"
                   ]
                 },
                 {
                   "step": 3,
                   "title": "检查防火墙日志",
-                  "detail": "查看 pfirewall.log 中的 DROP 记录。",
+                  "detail": "查看防火墙日志文件 (pfirewall.log) 中被 DROP 的出站连接记录，确认 Autopilot 需要的端点是否被阻断。",
                   "commands": [
-                    "Get-Content \"$env:systemroot\\system32\\LogFiles\\Firewall\\pfirewall.log\" | Select-String 'DROP'"
+                    "Get-Content \"$env:SystemRoot\\system32\\LogFiles\\Firewall\\pfirewall.log\" -Tail 100 | Select-String \"DROP\""
                   ]
                 },
                 {
                   "step": 4,
-                  "title": "手动更新签名",
-                  "detail": "FQDN 规则依赖 Network Protection，后者依赖最新 Defender 签名。",
+                  "title": "检查 FQDN 规则解析状态",
+                  "detail": "查看基于 FQDN 的防火墙规则的实际地址解析结果。如果 RemoteAddress 为空或 \"Any\"，说明 FQDN 未被解析，规则实际上变成了阻断所有出站流量。",
+                  "commands": [
+                    "Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {$_.DisplayName -match 'FQDN|URL|domain'} | Get-NetFirewallAddressFilter | Format-Table"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "确认 Network Protection 服务",
+                  "detail": "WdNisSvc (Windows Defender Network Inspection Service) 是 Network Protection 的核心服务，必须处于运行状态 FQDN 规则才能正常工作。",
+                  "commands": [
+                    "Get-Service WdNisSvc | Format-Table Name, Status, StartType"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "手动更新 Defender 签名（关键修复步骤）",
+                  "detail": "这是最关键的修复步骤。更新 Defender 签名后 Network Protection 引擎可以正常启动，FQDN 规则将能够正确解析域名到 IP 地址。",
+                  "commands": [
+                    "Update-MpSignature -UpdateSource MicrosoftUpdateServer"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "验证签名更新后的状态",
+                  "detail": "确认 Defender 签名已成功更新到最新版本，更新日期应为当天或近期。",
+                  "commands": [
+                    "Get-MpComputerStatus | Select AntivirusSignatureLastUpdated"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "重新评估防火墙规则",
+                  "detail": "签名更新后 Network Protection 应能启动，FQDN 规则应能正常解析。重新检查防火墙日志确认不再 DROP Autopilot 需要的出站流量。",
+                  "commands": [
+                    "Get-Content \"$env:SystemRoot\\system32\\LogFiles\\Firewall\\pfirewall.log\" -Tail 50 | Select-String \"DROP\""
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "在 Autopilot 部署中添加预配步骤",
+                  "detail": "为防止此问题在后续新设备部署时重现，在 Autopilot 配置文件或 Enrollment Status Page (ESP) 阶段添加 PowerShell 脚本确保每次新部署前 Defender 签名最新。",
                   "commands": [
                     "Update-MpSignature"
                   ]
+                },
+                {
+                  "step": 10,
+                  "title": "替代方案",
+                  "detail": "如果无法即时更新 Defender 签名（例如网络受限环境），考虑将 FQDN 规则临时替换为 IP 范围规则，或在 Autopilot 初始阶段不启用出站限制策略。",
+                  "commands": []
                 }
               ],
               "rootCauses": [
                 "Autopilot OOBE 期间 Defender 签名过期 → Network Protection 无法启动",
-                "FQDN 规则解析为空集 → 变为\"阻断所有\"效果",
+                "FQDN 规则解析为空集 → 变为 \"阻断所有\" 效果",
+                "Network Protection 引擎需要最新签名才能初始化",
+                "WdNisSvc 服务未运行导致 FQDN 解析功能不可用",
                 "解决：在 Autopilot 配置中添加 Update-MpSignature 步骤"
               ]
             },
@@ -1097,42 +1560,91 @@
               "name": "MDE 下 AllowLocalPolicyMerge 不生效",
               "severity": "medium",
               "symptoms": [
-                "通过 MDE (Microsoft Defender for Endpoint) 配置 AllowLocalPolicyMerge=false 但本地规则仍然生效",
-                "GPO 配置的同一设置能正常工作"
+                "通过 MDE (Microsoft Defender for Endpoint) 配置 AllowLocalPolicyMerge=False 但本地创建的防火墙规则仍然生效",
+                "同样的设置通过 GPO 部署时工作正常",
+                "Intune/MDE 合规性报告显示策略已成功应用",
+                "本地管理员仍然可以添加和启用防火墙规则",
+                "注册表中 local store 的值已设为 False 但不生效",
+                "GPO 和 MDE 同时管理防火墙时出现策略冲突"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "检查注册表存储位置",
-                  "detail": "确认 AllowLocalPolicyMerge 的存储位置。",
+                  "title": "检查本地存储中的设置",
+                  "detail": "确认 AllowLocalPolicyMerge 在 local store 注册表路径中的值。MDE 可能将设置写到了这个路径。",
                   "commands": [
                     "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile\" /v AllowLocalPolicyMerge"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查 MDM 存储",
-                  "detail": "确认 MDM 存储中的设置。",
+                  "title": "检查 MDM 存储中的设置",
+                  "detail": "确认 MDM store 注册表路径中 AllowLocalPolicyMerge 的值。关键：MDM store 优先级高于 local store。如果此键不存在或值为 1(True)，即使 local store 设为 False，最终结果仍为 True。",
                   "commands": [
-                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\DomainProfile\" /v AllowLocalPolicyMerge"
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\DomainProfile\" /v AllowLocalPolicyMerge 2>$null"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "确认优先级",
-                  "detail": "MDM 存储优先于本地存储，MDE 可能写入本地存储而非 MDM 存储。",
+                  "title": "理解优先级关系",
+                  "detail": "防火墙策略的优先级顺序是：MDM Store > Local Store。即使 Local Store 设为 False，如果 MDM Store 的默认值为 True，最终生效的值仍然是 True。这是 MDE 配置不生效的根本原因。",
                   "commands": []
                 },
                 {
                   "step": 4,
-                  "title": "使用 GPO 替代",
-                  "detail": "改用组策略部署此设置。",
+                  "title": "检查所有配置文件",
+                  "detail": "对 DomainProfile、PrivateProfile、PublicProfile 分别检查 local store 和 MDM store 两个注册表路径中的 AllowLocalPolicyMerge 值。",
+                  "commands": [
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\PrivateProfile\" /v AllowLocalPolicyMerge",
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\PublicProfile\" /v AllowLocalPolicyMerge",
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\PrivateProfile\" /v AllowLocalPolicyMerge 2>$null",
+                    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\PublicProfile\" /v AllowLocalPolicyMerge 2>$null"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "检查 GPO 设置（对比）",
+                  "detail": "导出 GPO 结果报告，查看 Group Policy 中防火墙的 AllowLocalPolicyMerge 设置，与 MDE 设置对比确认差异。",
+                  "commands": [
+                    "gpresult /h C:\\temp\\gpresult.html"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "使用 MDM 诊断工具",
+                  "detail": "收集 MDM 诊断数据，检查 MDE 实际推送了什么防火墙策略值到设备上。",
+                  "commands": [
+                    "mdmdiagnosticstool.exe -area DeviceEnrollment -cab C:\\temp\\mdm_diag.cab"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "修复方案 A - 通过 GPO 部署",
+                  "detail": "将 AllowLocalPolicyMerge 改为通过 Group Policy 部署而非 MDE。GPO 直接写入生效路径，不受 MDM store 优先级影响。",
                   "commands": []
+                },
+                {
+                  "step": 8,
+                  "title": "修复方案 B - 直接修改 MDM 注册表",
+                  "detail": "手动在 MDM store 注册表路径中设置 AllowLocalPolicyMerge 为 0。注意：此设置可能在下次 MDM sync 时被覆盖回默认值。",
+                  "commands": [
+                    "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\DomainProfile\" /v AllowLocalPolicyMerge /t REG_DWORD /d 0 /f"
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "验证修复效果",
+                  "detail": "创建一条测试本地防火墙规则，确认策略合并禁用后该规则是否仍然生效。如果策略合并已正确禁用，本地规则应不出现在生效策略中。",
+                  "commands": [
+                    "New-NetFirewallRule -DisplayName \"Test Local Rule\" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 99999 -Profile Domain",
+                    "Get-NetFirewallRule -DisplayName \"Test Local Rule\""
+                  ]
                 }
               ],
               "rootCauses": [
                 "MDE 将 AllowLocalPolicyMerge 写入 local store 而非 MDM store",
                 "MDM store 优先级更高且默认值为 true，覆盖了本地设置",
+                "GPO 和 MDE 策略来源优先级冲突",
                 "解决：通过 GPO 部署或直接修改 MDM 注册表路径"
               ]
             }
@@ -1149,44 +1661,108 @@
               "name": "VPN 连接时高 CPU / 黑屏",
               "severity": "high",
               "symptoms": [
-                "连接 VPN 后 CPU 100% 持续数分钟",
-                "屏幕黑屏或桌面无响应",
-                "事件日志出现 WFP Transaction Watchdog Timeout (Event ID 5152 或相关)",
-                "断开 VPN 后逐渐恢复"
+                "连接 VPN 后 CPU 立即飙升至 100%，持续数分钟甚至更长",
+                "屏幕黑屏或 Explorer 无响应",
+                "系统事件日志出现 \"WFP Transaction Watchdog Timeout\" 相关事件",
+                "WFP 交易耗时远超 500ms 默认阈值（可达 60+ 秒）",
+                "断开 VPN 后 CPU 逐渐恢复正常",
+                "问题在网络变更（连接/断开 VPN、IP 地址变化）时触发",
+                "防火墙规则中包含大量 -LocalAddress 条件"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "检查 WFP Watchdog 事件",
-                  "detail": "查看是否有 WFP Transaction Watchdog Timeout 事件。",
+                  "title": "确认 CPU 消耗进程",
+                  "detail": "在 VPN 连接后立即检查 CPU 占用最高的进程。通常是 svchost (BFE/MpsSvc) 或 System 进程消耗了大量 CPU。",
                   "commands": [
-                    "Get-WinEvent -LogName Security -FilterXPath \"*[System[EventID=5152]]\" -MaxEvents 20"
+                    "Get-Process | Sort CPU -Desc | Select -First 10 Name, Id, CPU, WorkingSet64"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "分析防火墙规则复杂度",
-                  "detail": "检查带有复杂 -LocalAddress 条件的规则数量。",
+                  "title": "检查 WFP 相关事件",
+                  "detail": "查看安全日志中的 WFP 审计事件（Event ID 5152 丢包、5031 阻断、5157 连接阻断），这些事件可以反映 WFP 的处理状态。",
                   "commands": [
-                    "Get-NetFirewallRule | Get-NetFirewallAddressFilter | Where LocalAddress -ne 'Any' | Measure-Object"
+                    "Get-WinEvent -LogName Security -FilterXPath \"*[System[EventID=5152 or EventID=5031 or EventID=5157]]\" -MaxEvents 30 | Format-List TimeCreated, Message"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "检查规则处理耗时",
-                  "detail": "WFP Transaction Watchdog 默认 500ms 超时，复杂规则可导致 60+ 秒。",
-                  "commands": []
+                  "title": "检查 BFE 服务 CPU",
+                  "detail": "BFE (Base Filtering Engine) 是 WFP 规则处理的核心服务。获取 BFE 所在 svchost 进程的 CPU 使用情况，确认是否为高 CPU 的来源。",
+                  "commands": [
+                    "$bfePid = (Get-CimInstance Win32_Service -Filter \"Name='BFE'\").ProcessId; Get-Process -Id $bfePid | Select Name, Id, CPU"
+                  ]
                 },
                 {
                   "step": 4,
-                  "title": "ETW 跟踪",
-                  "detail": "使用 TSS 工具收集 WFP 跟踪，分析 IndexTrieAddFilter / IndexTrieDeleteFilter 调用耗时。",
+                  "title": "分析防火墙规则中的 LocalAddress 条件",
+                  "detail": "统计带有复杂 -LocalAddress 条件的防火墙规则数量。大量包含地址范围的规则会导致 WFP 在网络变更时使用 IndexTrie 算法重新计算，产生指数级的处理开销。",
+                  "commands": [
+                    "Get-NetFirewallRule | Get-NetFirewallAddressFilter | Where-Object {$_.LocalAddress -ne 'Any' -and $_.LocalAddress -ne '*'} | Measure-Object",
+                    "Get-NetFirewallRule | Get-NetFirewallAddressFilter | Where-Object {$_.LocalAddress -ne 'Any' -and $_.LocalAddress -ne '*'} | Select-Object -First 10 | Format-List"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "使用 ETW 跟踪 WFP 性能",
+                  "detail": "启用 WFP 诊断跟踪来捕获 VPN 连接期间 WFP 的处理过程。分析 IndexTrieAddFilter/IndexTrieDeleteFilter 调用的耗时。",
+                  "commands": [
+                    "netsh wfp capture start file=C:\\temp\\wfp_trace.cab",
+                    "netsh wfp capture stop"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "检查 WFP 过滤器数量",
+                  "detail": "导出 WFP 过滤器列表，统计过滤器总数。搜索包含多个地址范围的过滤器，这些是导致性能问题的关键因素。",
+                  "commands": [
+                    "netsh wfp show filters file=C:\\temp\\wfp_filters.xml"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "收集 TSS 网络诊断",
+                  "detail": "使用 Microsoft TSS 工具收集 NET_Firewall 场景的完整诊断数据，包括 WFP 状态、事件日志、注册表等信息。",
+                  "commands": [
+                    "TSS.ps1 -Scenario NET_Firewall -StartNoWait"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "使用 WPR 抓取 CPU Profile",
+                  "detail": "使用 Windows Performance Recorder (WPR) 在 VPN 连接时抓取 CPU 性能剖析数据。在 WPA (Windows Performance Analyzer) 中分析调用栈，查找 IndexTrieAddFilter/IndexTrieDeleteFilter 的占比。",
+                  "commands": [
+                    "wpr -start cpu -filemode",
+                    "wpr -stop C:\\temp\\cpu_profile.etl"
+                  ]
+                },
+                {
+                  "step": 9,
+                  "title": "修复 - 简化规则",
+                  "detail": "移除或简化包含大量 -LocalAddress 范围的规则。如果必须限制源地址，尝试减少地址范围数量或合并为更大的 CIDR 块以降低 IndexTrie 计算复杂度。",
+                  "commands": []
+                },
+                {
+                  "step": 10,
+                  "title": "临时缓解 - 连接 VPN 前禁用问题规则",
+                  "detail": "在连接 VPN 前暂时禁用包含大量 LocalAddress 条件的规则，连接稳定后重新启用。这可以避免 VPN 连接时的 CPU 峰值。",
+                  "commands": [
+                    "Get-NetFirewallRule -DisplayName \"*问题规则名*\" | Disable-NetFirewallRule"
+                  ]
+                },
+                {
+                  "step": 11,
+                  "title": "等待 OS 修复",
+                  "detail": "Microsoft 已知此 IndexTrie 算法在处理大量地址范围时的性能问题，需要 OS 级别的优化修复。关注后续 Windows 更新中的修复。",
                   "commands": []
                 }
               ],
               "rootCauses": [
                 "防火墙规则包含大量 -LocalAddress 范围导致 IndexTrie 算法指数级处理时间",
                 "VPN 连接/断开触发所有 WFP 规则重新评估",
+                "WFP Transaction Watchdog 超时（默认 500ms 阈值被大幅超越）",
+                "BFE 服务在网络变更时需要重建所有地址过滤器索引",
                 "解决：简化 -LocalAddress 条件，减少地址范围数量；等待 OS 修复 TRIE 优化"
               ]
             },
@@ -1195,48 +1771,88 @@
               "name": "防火墙丢包导致登录缓慢",
               "severity": "medium",
               "symptoms": [
-                "AAD (Entra ID) 用户登录异常缓慢",
+                "Azure AD (Entra ID) 用户登录异常缓慢（数分钟而非秒级）",
                 "防火墙日志显示到 login.microsoftonline.com 的包被 DROP",
-                "登录最终成功但耗时数分钟"
+                "登录最终能成功（通过重试或回退路径）",
+                "Windows 10 环境更常见",
+                "密码重置或首次登录时更明显",
+                "防火墙日志中 DROP 的目标 IP 属于 Azure AD 服务 IP 范围 (20.190.x.x, 40.126.x.x)"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "检查防火墙日志",
-                  "detail": "查看 pfirewall.log 中是否有 DROP + login.microsoftonline.com 记录。",
+                  "title": "启用防火墙日志",
+                  "detail": "配置防火墙日志记录阻断和允许的连接，增大日志文件大小以确保不会因文件满而丢失记录。",
                   "commands": [
-                    "Get-Content \"$env:systemroot\\system32\\LogFiles\\Firewall\\pfirewall.log\" | Select-String 'DROP'"
+                    "Set-NetFirewallProfile -All -LogFileName \"%systemroot%\\system32\\LogFiles\\Firewall\\pfirewall.log\" -LogBlocked True -LogAllowed True -LogMaxSizeKilobytes 32768"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查出站规则",
-                  "detail": "查看是否有阻断出站连接的规则。",
+                  "title": "检查防火墙日志中的 DROP",
+                  "detail": "在防火墙日志中搜索到 AAD 端点的 DROP 记录。AAD 的主要 IP 范围包括 20.190.x.x 和 40.126.x.x。",
                   "commands": [
-                    "Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True | Get-NetFirewallApplicationFilter"
+                    "Get-Content \"$env:SystemRoot\\system32\\LogFiles\\Firewall\\pfirewall.log\" -Tail 200 | Select-String \"DROP\" | Select-String \"login.microsoftonline.com|20.190.|40.126.\""
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "测试绕过",
-                  "detail": "临时关闭防火墙测试登录速度 (仅测试用)。",
+                  "title": "检查出站阻断规则",
+                  "detail": "列出所有启用的出站阻断规则，确认是否有规则阻断了 HTTPS (443) 出站连接。",
                   "commands": [
-                    "Set-NetFirewallProfile -All -Enabled False"
+                    "Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True | Format-Table DisplayName, Profile"
                   ]
                 },
                 {
                   "step": 4,
-                  "title": "检查代理设置",
-                  "detail": "代理配置可能影响直连。",
+                  "title": "检查 WFP 丢包详情",
+                  "detail": "导出 WFP 网络事件数据，搜索目标端口 443 且目标地址在 AAD IP 范围内的 DROP 事件，确认是哪条 WFP 过滤器导致丢包。",
                   "commands": [
-                    "netsh winhttp show proxy"
+                    "netsh wfp show netevents file=C:\\temp\\wfp_netevents.xml"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "测试 AAD 端点连通性",
+                  "detail": "直接测试到 AAD 认证端点的 TCP 443 连通性和 HTTPS 可达性。",
+                  "commands": [
+                    "Test-NetConnection -ComputerName login.microsoftonline.com -Port 443",
+                    "Invoke-WebRequest -Uri \"https://login.microsoftonline.com\" -UseBasicParsing -TimeoutSec 10"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "对比防火墙开关测试（仅测试环境）",
+                  "detail": "在安全的测试环境中临时禁用防火墙，测试登录速度是否显著改善。测试完成后立即重新启用防火墙。注意：不要在生产环境执行此操作。",
+                  "commands": [
+                    "Set-NetFirewallProfile -All -Enabled False",
+                    "Set-NetFirewallProfile -All -Enabled True"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "添加允许规则修复",
+                  "detail": "创建明确的出站允许规则，放行到 Azure AD 端点 IP 范围的 HTTPS 流量。这是推荐的永久修复方案。",
+                  "commands": [
+                    "New-NetFirewallRule -DisplayName \"Allow AAD Authentication\" -Direction Outbound -Action Allow -Protocol TCP -RemotePort 443 -RemoteAddress 20.190.128.0/18,40.126.0.0/18 -Profile Any -Enabled True"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "检查代理配置",
+                  "detail": "检查系统和用户级别的代理配置。代理可能影响 AAD 认证的直连路径，导致防火墙规则评估结果不同。",
+                  "commands": [
+                    "netsh winhttp show proxy",
+                    "Get-ItemProperty \"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" | Select ProxyEnable, ProxyServer"
                   ]
                 }
               ],
               "rootCauses": [
-                "防火墙出站规则阻断了 AAD 认证流量",
-                "规则配置过严导致 login.microsoftonline.com 被误阻断",
-                "解决：添加允许到 AAD 端点的出站规则"
+                "防火墙出站规则阻断了 AAD 认证流量 (login.microsoftonline.com)",
+                "规则配置过严导致 AAD IP 范围被误阻断",
+                "Default Outbound 规则为 Block 但未添加 AAD 端点的允许规则",
+                "代理配置干扰导致直连路径被阻断",
+                "解决：添加允许到 AAD 端点 (20.190.128.0/18, 40.126.0.0/18) 的出站规则"
               ]
             }
           ]
@@ -1252,44 +1868,84 @@
               "name": "第三方 VPN 的 WFP 过滤器丢包",
               "severity": "medium",
               "symptoms": [
-                "使用 Cisco AnyConnect 时无法访问 Captive Portal",
-                "网络诊断显示 NgcSock 相关过滤器丢弃数据包",
-                "升级 WebView2 Runtime 到 117+ 后出现"
+                "使用 Cisco AnyConnect VPN 时无法访问 Wi-Fi Captive Portal (酒店/机场 Wi-Fi 登录页)",
+                "网络诊断或 WFP 日志显示 \"NgcSock ALE Connect Callout V4\" 过滤器丢弃数据包",
+                "升级 WebView2 Runtime 到 117 或更高版本后开始出现",
+                "断开 AnyConnect 后 Captive Portal 可以正常访问",
+                "Cisco Bug ID: CSCwh75976",
+                "问题仅影响需要通过 WebView2 显示的 Captive Portal 页面"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
-                  "title": "检查 WFP 过滤器",
-                  "detail": "查找 NgcSock 相关过滤器。",
+                  "title": "确认 Cisco AnyConnect 版本",
+                  "detail": "检查当前安装的 Cisco AnyConnect 版本，确认是否低于包含 CSCwh75976 修复的版本。",
                   "commands": [
-                    "netsh wfp show filters"
+                    "Get-ItemProperty \"HKLM:\\SOFTWARE\\Cisco\\Cisco AnyConnect Secure Mobility Client\" -ErrorAction SilentlyContinue | Select DisplayVersion",
+                    "Get-CimInstance Win32_Product | Where Name -match 'AnyConnect' | Select Name, Version"
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查 WFP 丢包统计",
-                  "detail": "过滤 DROP 事件，确认丢包过滤器 ID。",
+                  "title": "检查 WebView2 Runtime 版本",
+                  "detail": "确认 WebView2 Runtime 版本是否为 117 或更高。117+ 版本改变了网络调用方式，触发了 AnyConnect WFP 过滤器的兼容性问题。",
                   "commands": [
-                    "netsh wfp show netevents"
+                    "Get-ItemProperty \"HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\" -ErrorAction SilentlyContinue | Select pv"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "确认 Cisco AnyConnect 版本",
-                  "detail": "检查是否有已知修复 (CSCwh75976)。",
-                  "commands": []
+                  "title": "检查 WFP 过滤器",
+                  "detail": "导出 WFP 过滤器列表，搜索 \"NgcSock\" 关键字，确认 Cisco AnyConnect 注册了哪些 WFP callout 过滤器。",
+                  "commands": [
+                    "netsh wfp show filters file=C:\\temp\\wfp_filters.xml"
+                  ]
                 },
                 {
                   "step": 4,
-                  "title": "临时测试",
-                  "detail": "断开 AnyConnect 测试网络是否恢复。",
+                  "title": "检查 WFP 丢包事件",
+                  "detail": "导出 WFP 网络事件数据，搜索 DROP 事件并确认丢包的 Filter ID 是否对应 NgcSock 相关的 AnyConnect 过滤器。",
+                  "commands": [
+                    "netsh wfp show netevents file=C:\\temp\\wfp_events.xml"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "实时监控 WFP 丢包",
+                  "detail": "使用 pktmon 捕获被丢弃的网络包，尝试访问 Captive Portal 复现问题，然后分析丢包原因和丢包组件。",
+                  "commands": [
+                    "pktmon start --capture --type drop -f C:\\temp\\pktmon_drops.etl",
+                    "pktmon stop",
+                    "pktmon format C:\\temp\\pktmon_drops.etl -o C:\\temp\\drops.txt"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "抓包对比分析",
+                  "detail": "使用 netsh trace 抓取完整网络跟踪，分析 Captive Portal 的 HTTP 重定向是否被 AnyConnect WFP 过滤器阻断。",
+                  "commands": [
+                    "netsh trace start capture=yes tracefile=C:\\temp\\captive_trace.etl",
+                    "netsh trace stop"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "临时测试 - 断开 AnyConnect",
+                  "detail": "断开 Cisco AnyConnect VPN 连接后测试 Captive Portal 是否可以正常访问。如果恢复正常，确认问题与 AnyConnect WFP 过滤器相关。",
+                  "commands": []
+                },
+                {
+                  "step": 8,
+                  "title": "修复方案",
+                  "detail": "升级 Cisco AnyConnect 到包含 CSCwh75976 修复的版本。如果无法升级，联系 Cisco TAC 获取修复补丁或临时解决方案。",
                   "commands": []
                 }
               ],
               "rootCauses": [
                 "Cisco AnyConnect 的 WFP 过滤器 (NgcSock ALE Connect Callout V4) 阻断 Captive Portal 流量",
-                "WebView2 Runtime 117+ 改变了网络调用方式触发 AnyConnect 过滤器",
-                "解决：升级 Cisco AnyConnect 或重新配置 WFP 过滤器"
+                "WebView2 Runtime 117+ 改变了网络调用方式触发 AnyConnect 过滤器兼容性问题",
+                "Cisco Bug ID: CSCwh75976",
+                "解决：升级 Cisco AnyConnect 到包含修复的版本"
               ]
             },
             {
@@ -1297,46 +1953,87 @@
               "name": "防火墙日志文件无法创建",
               "severity": "low",
               "symptoms": [
-                "配置了防火墙日志但日志文件未生成",
-                "防火墙日志路径存在且权限正确",
-                "Server 2022 环境"
+                "在 wf.msc 中配置了防火墙日志但日志文件始终为空或不存在",
+                "日志路径 (%systemroot%\\system32\\LogFiles\\Firewall\\) 存在且权限看起来正确",
+                "MpsSvc 服务运行正常",
+                "Windows Server 2022 环境",
+                "Event Log 中可能有防火墙相关的错误事件",
+                "netsh advfirewall show allprofiles 显示日志已配置但文件大小为 0"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
                   "title": "检查日志配置",
-                  "detail": "确认防火墙日志路径和启用状态。",
+                  "detail": "确认所有防火墙配置文件（Domain/Private/Public）的日志文件名、最大大小、阻断和允许日志的启用状态。",
                   "commands": [
-                    "netsh advfirewall show allprofiles | findstr -i log"
+                    "netsh advfirewall show allprofiles | findstr -i \"LogFile\\|LogMax\\|LogDrop\\|LogSuccess\""
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查文件路径权限",
-                  "detail": "确认日志目录权限。",
+                  "title": "确认日志路径",
+                  "detail": "分别检查每个配置文件的日志文件路径设置，确认默认路径是否正确。",
                   "commands": [
-                    "icacls \"%systemroot%\\system32\\LogFiles\\Firewall\\\""
+                    "$profiles = 'domainprofile','privateprofile','publicprofile'; foreach($p in $profiles) { netsh advfirewall show $p | Select-String 'FileName' }"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "手动创建测试",
-                  "detail": "尝试手动在目标路径创建文件。",
-                  "commands": []
+                  "title": "检查文件和目录权限",
+                  "detail": "确认日志目录的 ACL 权限。MpsSvc 服务运行在 NT SERVICE\\mpssvc 账户下，需要对日志目录有写入权限。",
+                  "commands": [
+                    "icacls \"$env:SystemRoot\\system32\\LogFiles\\Firewall\\\""
+                  ]
                 },
                 {
                   "step": 4,
-                  "title": "检查 MpsSvc 事件",
-                  "detail": "查看防火墙高级安全日志。",
+                  "title": "手动创建文件测试",
+                  "detail": "测试是否可以在目标目录手动创建文件，排除文件系统级别的权限或空间问题。",
                   "commands": [
-                    "Get-WinEvent -LogName 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' -MaxEvents 50"
+                    "New-Item -Path \"$env:SystemRoot\\system32\\LogFiles\\Firewall\\test.txt\" -ItemType File -Force; Remove-Item \"$env:SystemRoot\\system32\\LogFiles\\Firewall\\test.txt\""
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "检查 MpsSvc 事件日志",
+                  "detail": "查看防火墙高级安全事件日志中是否有与日志文件创建或写入相关的错误记录。",
+                  "commands": [
+                    "Get-WinEvent -LogName 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' -MaxEvents 100 | Where Message -match 'log|file|error|fail' | Format-List TimeCreated, Id, Message"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "使用 Procmon 监控文件操作",
+                  "detail": "使用 Process Monitor 监控 svchost.exe 对 pfirewall.log 文件的操作，过滤 Result != SUCCESS 的条目，查看具体的 CreateFile/WriteFile 错误代码。",
+                  "commands": [
+                    "Procmon.exe /AcceptEula"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "重新配置日志",
+                  "detail": "使用 PowerShell 重新配置防火墙日志设置并重启 MpsSvc 服务，有时重新配置可以解决日志创建失败的问题。",
+                  "commands": [
+                    "Set-NetFirewallProfile -All -LogFileName \"%systemroot%\\system32\\LogFiles\\Firewall\\pfirewall.log\" -LogBlocked True -LogAllowed False -LogMaxSizeKilobytes 4096",
+                    "Restart-Service MpsSvc"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "替代方案 - 使用 WFP Auditing",
+                  "detail": "如果防火墙日志无法修复，可以启用 WFP 审计作为替代方案。启用后在安全事件日志 (Event ID 5152/5157) 中查看丢包和连接事件。",
+                  "commands": [
+                    "auditpol /set /subcategory:\"Filtering Platform Packet Drop\" /success:enable /failure:enable",
+                    "auditpol /set /subcategory:\"Filtering Platform Connection\" /success:enable /failure:enable"
                   ]
                 }
               ],
               "rootCauses": [
                 "MpsSvc 在调用 CreateFile 时遇到意外错误",
-                "文件系统权限问题或路径异常",
-                "Windows Server 2022 特定问题"
+                "文件系统权限问题（NT SERVICE\\mpssvc 缺少写入权限）",
+                "日志目录路径异常或不存在",
+                "Windows Server 2022 特定 Bug",
+                "磁盘空间不足导致无法创建日志文件"
               ]
             }
           ]
@@ -1352,46 +2049,87 @@
               "name": "防火墙 MMC 远程连接失败 0x6d9",
               "severity": "medium",
               "symptoms": [
-                "使用 wf.msc 连接远程计算机时报错 0x6d9 (EPT_S_NOT_REGISTERED)",
-                "Windows 11 24H2 或 Server 2025 环境",
-                "本地防火墙管理正常"
+                "使用 wf.msc → \"Connect to Another Computer\" 时报错",
+                "错误代码 0x6d9 (EPT_S_NOT_REGISTERED - \"There are no more endpoints available from the endpoint mapper\")",
+                "目标计算机运行 Windows 11 24H2 或 Server 2025",
+                "本地防火墙管理 (wf.msc) 工作正常",
+                "远程 PowerShell (Enter-PSSession) 管理防火墙工作正常",
+                "远程连接其他旧版本 Windows 的防火墙 MMC 正常"
               ],
               "troubleshooting": [
                 {
                   "step": 1,
                   "title": "确认远程计算机 OS 版本",
-                  "detail": "确认目标计算机操作系统版本。",
+                  "detail": "确认目标计算机的操作系统版本，此问题主要影响 Windows 11 24H2 和 Server 2025。",
                   "commands": [
-                    "systeminfo | findstr /i \"os.*version\""
+                    "Invoke-Command -ComputerName <remote> -ScriptBlock { Get-ComputerInfo | Select OsName, OsVersion, OsBuildNumber }",
+                    "systeminfo /s <remote> | findstr /i \"OS.*Version\""
                   ]
                 },
                 {
                   "step": 2,
-                  "title": "检查远程管理相关服务",
-                  "detail": "确认 RemoteRegistry 和 WinRM 服务运行中。",
+                  "title": "检查远程计算机的 RPC 服务",
+                  "detail": "确认目标计算机上 RPC 服务 (RpcSs) 和 RPC Endpoint Mapper (RpcEptMapper) 是否正常运行。这两个服务是远程管理的基础。",
                   "commands": [
-                    "Get-Service RemoteRegistry, WinRM -ComputerName <remote>"
+                    "Get-Service RpcSs, RpcEptMapper -ComputerName <remote> | Format-Table Name, Status"
                   ]
                 },
                 {
                   "step": 3,
-                  "title": "检查 RPC 端点映射",
-                  "detail": "测试 RPC endpoint mapper 是否可达。",
+                  "title": "测试 RPC 端点映射",
+                  "detail": "测试到目标计算机 RPC Endpoint Mapper 端口 (TCP 135) 的连通性。如果不可达，可能是网络或防火墙问题。",
                   "commands": [
-                    "portqry -n <remote> -e 135"
+                    "Test-NetConnection -ComputerName <remote> -Port 135"
                   ]
                 },
                 {
                   "step": 4,
-                  "title": "检查是否已知问题",
-                  "detail": "Win11 24H2 / Server 2025 的已知兼容性问题。",
-                  "commands": []
+                  "title": "检查远程管理相关服务",
+                  "detail": "确认 RemoteRegistry 服务在目标计算机上是否运行。某些远程管理操作需要此服务。",
+                  "commands": [
+                    "Get-Service RemoteRegistry -ComputerName <remote> | Format-Table Name, Status, StartType"
+                  ]
+                },
+                {
+                  "step": 5,
+                  "title": "检查远程防火墙规则",
+                  "detail": "通过 PowerShell 远程检查目标计算机上是否启用了允许远程管理的防火墙规则。",
+                  "commands": [
+                    "Invoke-Command -ComputerName <remote> -ScriptBlock { Get-NetFirewallRule -DisplayName \"*Remote*\" | Where Enabled -eq True | Format-Table DisplayName, Direction, Action }"
+                  ]
+                },
+                {
+                  "step": 6,
+                  "title": "测试 PowerShell 远程管理（替代方案）",
+                  "detail": "如果 MMC 远程连接不可用，PowerShell 远程管理通常仍然可以工作。使用 Enter-PSSession 或 Invoke-Command 可以完成所有防火墙管理操作。",
+                  "commands": [
+                    "Enter-PSSession -ComputerName <remote>",
+                    "Invoke-Command -ComputerName <remote> -ScriptBlock { Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction }"
+                  ]
+                },
+                {
+                  "step": 7,
+                  "title": "检查 COM/DCOM 配置",
+                  "detail": "检查目标计算机上的 DCOM 配置是否启用。MMC 远程管理依赖 DCOM 进行跨计算机通信。",
+                  "commands": [
+                    "dcomcnfg.exe"
+                  ]
+                },
+                {
+                  "step": 8,
+                  "title": "使用 PowerShell 远程管理替代 MMC",
+                  "detail": "这是 Windows 11 24H2 / Server 2025 的已知问题，等待 OS 修复。在修复发布前，使用 PowerShell 远程管理作为 MMC 的完整替代方案。",
+                  "commands": [
+                    "Invoke-Command -ComputerName <remote> -ScriptBlock { Get-NetFirewallRule | Format-Table }",
+                    "Invoke-Command -ComputerName <remote> -ScriptBlock { New-NetFirewallRule -DisplayName \"Example\" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8080 }"
+                  ]
                 }
               ],
               "rootCauses": [
                 "Windows 11 24H2 / Server 2025 RPC endpoint 注册变更",
                 "远程防火墙管理的 COM 接口兼容性问题",
-                "解决：等待 OS 修复；使用 PowerShell 远程管理替代"
+                "MMC snap-in 依赖的 RPC 接口在新版 OS 中未正确注册",
+                "解决：等待 OS 修复；使用 PowerShell 远程管理替代 MMC"
               ]
             }
           ]
